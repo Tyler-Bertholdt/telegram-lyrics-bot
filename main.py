@@ -19,7 +19,7 @@ app = FastAPI()
 
 
 # ------------------------------------------------------------------
-# LRC Time Shift Engine
+# LRC Time Shift & Formatting Engine
 # ------------------------------------------------------------------
 def shift_lrc_timestamp(match, shift_ms: int) -> str:
     """Adjusts a single [mm:ss.xx] timestamp by shift_ms milliseconds."""
@@ -62,6 +62,51 @@ def parse_shift_offset(text_arg: str) -> int:
         return int(float(text_arg))
     except ValueError:
         return 0
+
+
+def extract_lyrics_parts(raw_text: str):
+    """
+    Strips old headers and HTML tags to cleanly extract (title, lyrics_body).
+    Prevents header stacking!
+    """
+    clean_text = re.sub(r"</?(code|pre|b|i|a)[^>]*>", "", raw_text).strip()
+    lines = clean_text.split("\n")
+
+    title = ""
+    body_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("📝"):
+            title = stripped.replace("📝", "").strip()
+        elif stripped.startswith("⏱️") or "Adjusted Timestamps" in stripped:
+            continue  # Discard old timestamp shift header lines
+        else:
+            body_lines.append(line)
+
+    body = "\n".join(body_lines).strip()
+    return title, body
+
+
+def format_lyrics_message(title: str, lyrics_body: str, shift_status: str = None) -> str:
+    """
+    Formats the message so the lyrics are enclosed in a <code> block.
+    Tapping the lyrics in Telegram copies ONLY the lyrics to clipboard!
+    """
+    parts = []
+    if title:
+        parts.append(f"📝 <b>{title}</b>")
+    if shift_status:
+        parts.append(f"⏱️ <i>{shift_status}</i>")
+
+    # Ensure clean body inside <code> tag
+    clean_body = re.sub(r"</?(code|pre|b|i|a)[^>]*>", "", lyrics_body).strip()
+
+    if len(clean_body) > 3800:
+        clean_body = clean_body[:3700] + "\n\n...[Truncated]"
+
+    parts.append(f"<code>{clean_body}</code>")
+    return "\n\n".join(parts)
 
 
 # ------------------------------------------------------------------
@@ -125,8 +170,7 @@ def parse_search_query(query_text: str) -> dict:
     is_synced = bool(re.search(r"\$synced\b", query_text, re.IGNORECASE))
 
     lyric_type = "plain" if is_plain else "synced"
-    # Default is text in chat unless $file is explicitly specified
-    is_text_only = not is_file
+    is_text_only = not is_file  # Default is text in chat
 
     clean_text = re.sub(
         r"\$(file|lyrics|synced|plain)\b", "", query_text, flags=re.IGNORECASE
@@ -211,9 +255,9 @@ async def send_welcome(chat_id: int):
         '<code>/search "Bodysnatchers" $artist "Radiohead" $file</code>\n\n'
         "<b>3️⃣ Full Search with Duration:</b>\n"
         '<code>/search "Bodysnatchers" $artist "Radiohead" $album "In Rainbows" $duration "04:02"</code>\n\n'
-        "<b>🎛️ Time Editor Feature:</b>\n"
-        "Every lyrics message comes with interactive shift buttons!\n"
-        "You can also <b>reply to any message</b> with <code>/shift -300</code> or <code>/shift +500ms</code> to edit it!"
+        "<b>🎛️ One-Tap Copy & Time Editor:</b>\n"
+        "• Tap lyrics text once to copy <b>only</b> lyrics to clipboard!\n"
+        "• Tap ⏪ / ⏩ buttons or reply to any message with <code>/shift -300</code> to edit!"
     )
     await reply_telegram(chat_id, welcome_text)
 
@@ -255,13 +299,16 @@ async def handle_shift_command(chat_id: int, msg: dict):
         )
         return
 
-    shifted_text = apply_time_shift(target_text, shift_ms)
+    title, body = extract_lyrics_parts(target_text)
+    shifted_body = apply_time_shift(body, shift_ms)
     sign = "+" if shift_ms > 0 else ""
 
+    formatted_msg = format_lyrics_message(
+        title, shifted_body, f"Adjusted by {sign}{shift_ms}ms"
+    )
+
     await reply_telegram(
-        chat_id,
-        f"⏱️ <b>Adjusted Timestamps by {sign}{shift_ms}ms:</b>\n\n{shifted_text}",
-        reply_markup=build_editor_keyboard(),
+        chat_id, formatted_msg, reply_markup=build_editor_keyboard()
     )
 
 
@@ -364,24 +411,14 @@ async def process_callback(cb: dict):
     if callback_data == "convert_file":
         current_text = message.get("text", "")
         if current_text:
-            lines = current_text.strip().split("\n")
-            title_header = lines[0].replace("📝 ", "").replace("⏱️ ", "").strip()
-            if not title_header:
-                title_header = "lyrics"
-
-            filename = f"{title_header}.lrc"
-            # Remove title header line from lyrics file content
-            file_body = (
-                "\n".join(lines[2:])
-                if len(lines) > 2 and "Adjusted Timestamps" in lines[0]
-                else "\n".join(lines[1:]) if len(lines) > 1 else current_text
-            )
+            title, body = extract_lyrics_parts(current_text)
+            filename = f"{title}.lrc" if title else "lyrics.lrc"
 
             await send_telegram_document(
                 chat_id,
-                file_body.strip().encode("utf-8"),
+                body.strip().encode("utf-8"),
                 filename,
-                f"🎵 <b>{title_header}</b>",
+                f"🎵 <b>{title if title else 'Lyrics'}</b>",
             )
             await answer_callback_query(callback_id, "Sent as .lrc file!")
         else:
@@ -402,11 +439,17 @@ async def process_callback(cb: dict):
         current_text = message.get("text", "")
 
         if current_text and "[" in current_text:
-            shifted_text = apply_time_shift(current_text, shift_ms)
-            await edit_telegram_message(
-                chat_id, message_id, shifted_text, reply_markup=build_editor_keyboard()
-            )
+            title, body = extract_lyrics_parts(current_text)
+            shifted_body = apply_time_shift(body, shift_ms)
             sign = "+" if shift_ms > 0 else ""
+
+            formatted_msg = format_lyrics_message(
+                title, shifted_body, f"Adjusted by {sign}{shift_ms}ms"
+            )
+
+            await edit_telegram_message(
+                chat_id, message_id, formatted_msg, reply_markup=build_editor_keyboard()
+            )
             await answer_callback_query(callback_id, f"Adjusted {sign}{shift_ms}ms")
         else:
             await answer_callback_query(
@@ -445,18 +488,16 @@ async def process_callback(cb: dict):
 
     track_name = item.get("trackName", "Track")
     artist_name = item.get("artistName", "Artist")
+    title = f"{track_name} - {artist_name}"
 
     if mode_flag == "text":
-        header = f"📝 <b>{track_name} - {artist_name}</b>\n\n"
-        full_text = header + lyrics_content
-        if len(full_text) > 4000:
-            full_text = full_text[:3900] + "\n\n...[Truncated]"
+        formatted_msg = format_lyrics_message(title, lyrics_content)
         await reply_telegram(
-            chat_id, full_text, reply_markup=build_editor_keyboard()
+            chat_id, formatted_msg, reply_markup=build_editor_keyboard()
         )
     else:
-        filename = f"{track_name} - {artist_name}.{file_ext}"
-        caption = f"🎵 <b>{track_name}</b> - {artist_name}"
+        filename = f"{title}.{file_ext}"
+        caption = f"🎵 <b>{title}</b>"
         await send_telegram_document(
             chat_id, lyrics_content.encode("utf-8"), filename, caption
         )
