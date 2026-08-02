@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import httpx
@@ -18,10 +19,55 @@ app = FastAPI()
 
 
 # ------------------------------------------------------------------
+# LRC Time Shift Engine
+# ------------------------------------------------------------------
+def shift_lrc_timestamp(match, shift_ms: int) -> str:
+    """Adjusts a single [mm:ss.xx] timestamp by shift_ms milliseconds."""
+    m = int(match.group(1))
+    s = int(match.group(2))
+    frac_str = match.group(3)
+
+    ms = int(frac_str) * 10 if len(frac_str) == 2 else int(frac_str)
+    total_ms = (m * 60 + s) * 1000 + ms + shift_ms
+
+    if total_ms < 0:
+        total_ms = 0
+
+    new_m = total_ms // 60000
+    rem_ms = total_ms % 60000
+    new_s = rem_ms // 1000
+    new_frac = (rem_ms % 1000) // 10
+
+    return f"[{new_m:02d}:{new_s:02d}.{new_frac:02d}]"
+
+
+def apply_time_shift(lrc_text: str, shift_ms: int) -> str:
+    """Finds all LRC timestamps in text and applies shift_ms offset."""
+    pattern = r"\[(\d{1,2}):(\d{2})\.(\d{2,3})\]"
+    return re.sub(pattern, lambda m: shift_lrc_timestamp(m, shift_ms), lrc_text)
+
+
+def parse_shift_offset(text_arg: str) -> int:
+    """Parses offsets like '-300', '-300ms', '+500', '-0.3s', '+1.5s' into integer ms."""
+    text_arg = text_arg.strip().lower()
+
+    if text_arg.endswith("s") and not text_arg.endswith("ms"):
+        try:
+            return int(float(text_arg[:-1]) * 1000)
+        except ValueError:
+            return 0
+
+    text_arg = text_arg.replace("ms", "")
+    try:
+        return int(float(text_arg))
+    except ValueError:
+        return 0
+
+
+# ------------------------------------------------------------------
 # Telegram API Helper Functions
 # ------------------------------------------------------------------
 async def reply_telegram(chat_id: int, text: str, reply_markup: dict = None):
-    """Sends a text message via Telegram REST API."""
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -35,10 +81,26 @@ async def reply_telegram(chat_id: int, text: str, reply_markup: dict = None):
         await client.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
 
 
+async def edit_telegram_message(
+    chat_id: int, message_id: int, text: str, reply_markup: dict = None
+):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(f"{TELEGRAM_API_URL}/editMessageText", json=payload)
+
+
 async def send_telegram_document(
     chat_id: int, file_bytes: bytes, filename: str, caption: str
 ):
-    """Sends a downloadable .lrc or .txt document via Telegram REST API."""
     files = {"document": (filename, file_bytes, "text/plain")}
     data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
 
@@ -46,12 +108,11 @@ async def send_telegram_document(
         await client.post(f"{TELEGRAM_API_URL}/sendDocument", data=data, files=files)
 
 
-async def answer_callback_query(callback_query_id: str):
-    """Acknowledges an inline button click to dismiss the loading spinner."""
+async def answer_callback_query(callback_query_id: str, text: str = ""):
     async with httpx.AsyncClient(timeout=5.0) as client:
         await client.post(
             f"{TELEGRAM_API_URL}/answerCallbackQuery",
-            json={"callback_query_id": callback_query_id},
+            json={"callback_query_id": callback_query_id, "text": text},
         )
 
 
@@ -59,14 +120,16 @@ async def answer_callback_query(callback_query_id: str):
 # Query Parser
 # ------------------------------------------------------------------
 def parse_search_query(query_text: str) -> dict:
-    is_text_only = bool(re.search(r"\$lyrics\b", query_text, re.IGNORECASE))
+    is_file = bool(re.search(r"\$file\b", query_text, re.IGNORECASE))
     is_plain = bool(re.search(r"\$plain\b", query_text, re.IGNORECASE))
     is_synced = bool(re.search(r"\$synced\b", query_text, re.IGNORECASE))
 
     lyric_type = "plain" if is_plain else "synced"
+    # Default is text in chat unless $file is explicitly specified
+    is_text_only = not is_file
 
     clean_text = re.sub(
-        r"\$(lyrics|synced|plain)\b", "", query_text, flags=re.IGNORECASE
+        r"\$(file|lyrics|synced|plain)\b", "", query_text, flags=re.IGNORECASE
     ).strip()
 
     artist_match = re.search(
@@ -114,43 +177,92 @@ def parse_search_query(query_text: str) -> dict:
     }
 
 
+def build_editor_keyboard() -> dict:
+    """Builds interactive inline shift & conversion buttons."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "⏪ -500ms", "callback_data": "shift_-500"},
+                {"text": "◀️ -100ms", "callback_data": "shift_-100"},
+                {"text": "▶️ +100ms", "callback_data": "shift_+100"},
+                {"text": "⏩ +500ms", "callback_data": "shift_+500"},
+            ],
+            [
+                {"text": "📁 Get as .lrc File", "callback_data": "convert_file"},
+                {
+                    "text": "✏️ Custom Shift (Reply /shift)",
+                    "callback_data": "shift_help",
+                },
+            ],
+        ]
+    }
+
+
 # ------------------------------------------------------------------
-# Handlers & Search Processors
+# Handlers & Processors
 # ------------------------------------------------------------------
 async def send_welcome(chat_id: int):
     welcome_text = (
         "<b>🎵 Welcome to LRCLIB Lyrics Bot!</b>\n\n"
         "Tap any template below to copy it, then edit and send:\n\n"
-        "<b>1️⃣ Synced Search (Default):</b>\n"
+        "<b>1️⃣ Default Search (In Chat Text):</b>\n"
         '<code>/search "Bodysnatchers" $artist "Radiohead"</code>\n\n'
-        "<b>2️⃣ Full Search:</b>\n"
+        "<b>2️⃣ Downloadable .lrc File Mode:</b>\n"
+        '<code>/search "Bodysnatchers" $artist "Radiohead" $file</code>\n\n'
+        "<b>3️⃣ Full Search with Duration:</b>\n"
         '<code>/search "Bodysnatchers" $artist "Radiohead" $album "In Rainbows" $duration "04:02"</code>\n\n'
-        "<b>3️⃣ Plain Lyrics Search:</b>\n"
-        '<code>/search "Bodysnatchers" $artist "Radiohead" $plain</code>\n\n'
-        "<b>4️⃣ Direct Chat Lyrics (No File):</b>\n"
-        '<code>/search "Bodysnatchers" $artist "Radiohead" $lyrics</code>\n\n'
-        "<b>💡 Commands:</b>\n"
-        "/search - Search lyrics with flags\n"
-        "/searchagain - Reset state\n"
-        "/help - Full guide"
+        "<b>🎛️ Time Editor Feature:</b>\n"
+        "Every lyrics message comes with interactive shift buttons!\n"
+        "You can also <b>reply to any message</b> with <code>/shift -300</code> or <code>/shift +500ms</code> to edit it!"
     )
     await reply_telegram(chat_id, welcome_text)
 
 
-async def send_help(chat_id: int):
-    help_text = (
-        "<b>📖 LRCLIB Bot Instructions</b>\n\n"
-        "<b>Available Flags:</b>\n"
-        "• <code>$artist \"Name\"</code> : Target artist\n"
-        "• <code>$album \"Name\"</code> : Target album\n"
-        "• <code>$duration \"MM:SS\"</code> : Target duration\n"
-        "• <code>$synced</code> : Filter synced lyrics (.lrc) [Default]\n"
-        "• <code>$plain</code> : Filter plain lyrics\n"
-        "• <code>$lyrics</code> : Direct chat output\n\n"
-        "<b>Example:</b>\n"
-        '<code>/search "Nude" $artist "Radiohead" $lyrics</code>'
+async def handle_shift_command(chat_id: int, msg: dict):
+    """Handles /shift command when replying to any previous lyrics message."""
+    text = (msg.get("text", "") or msg.get("caption", "")).strip()
+
+    parts = text.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await reply_telegram(
+            chat_id,
+            "ℹ️ <b>Usage:</b> Reply to any previous lyrics message with:\n"
+            "<code>/shift -300</code> (300ms earlier)\n"
+            "<code>/shift +500ms</code> (500ms later)\n"
+            "<code>/shift -0.5s</code> (0.5s earlier)",
+        )
+        return
+
+    shift_ms = parse_shift_offset(parts[1])
+    if shift_ms == 0:
+        await reply_telegram(
+            chat_id,
+            "⚠️ Invalid shift amount. Example: <code>/shift -300</code> or <code>/shift +500ms</code>",
+        )
+        return
+
+    reply_to = msg.get("reply_to_message")
+    if not reply_to:
+        await reply_telegram(
+            chat_id, "⚠️ Please reply directly to a lyrics message or document!"
+        )
+        return
+
+    target_text = reply_to.get("text", "") or reply_to.get("caption", "")
+    if not target_text or "[" not in target_text:
+        await reply_telegram(
+            chat_id, "❌ No timestamped lyrics found in the replied message."
+        )
+        return
+
+    shifted_text = apply_time_shift(target_text, shift_ms)
+    sign = "+" if shift_ms > 0 else ""
+
+    await reply_telegram(
+        chat_id,
+        f"⏱️ <b>Adjusted Timestamps by {sign}{shift_ms}ms:</b>\n\n{shifted_text}",
+        reply_markup=build_editor_keyboard(),
     )
-    await reply_telegram(chat_id, help_text)
 
 
 async def process_search(chat_id: int, query_text: str):
@@ -207,7 +319,6 @@ async def process_search(chat_id: int, query_text: str):
 
     response_text = f"<b>🔍 Top Results ({target_type.upper()} Mode):</b>\n\n"
     keyboard = []
-
     mode_flag = "text" if parsed["is_text_only"] else "file"
 
     for idx, item in enumerate(sorted_results):
@@ -229,7 +340,6 @@ async def process_search(chat_id: int, query_text: str):
             f"🔗 https://lrclib.net/db/single/{item_id}\n\n"
         )
 
-        # Encode track_id and output mode into callback_data
         keyboard.append(
             [
                 {
@@ -243,9 +353,69 @@ async def process_search(chat_id: int, query_text: str):
     await reply_telegram(chat_id, response_text, reply_markup=reply_markup)
 
 
-async def process_callback(callback_data: str, chat_id: int, callback_id: str):
-    await answer_callback_query(callback_id)
+async def process_callback(cb: dict):
+    callback_id = cb["id"]
+    callback_data = cb.get("data", "")
+    message = cb.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
 
+    # Handle Conversion to .lrc File Button
+    if callback_data == "convert_file":
+        current_text = message.get("text", "")
+        if current_text:
+            lines = current_text.strip().split("\n")
+            title_header = lines[0].replace("📝 ", "").replace("⏱️ ", "").strip()
+            if not title_header:
+                title_header = "lyrics"
+
+            filename = f"{title_header}.lrc"
+            # Remove title header line from lyrics file content
+            file_body = (
+                "\n".join(lines[2:])
+                if len(lines) > 2 and "Adjusted Timestamps" in lines[0]
+                else "\n".join(lines[1:]) if len(lines) > 1 else current_text
+            )
+
+            await send_telegram_document(
+                chat_id,
+                file_body.strip().encode("utf-8"),
+                filename,
+                f"🎵 <b>{title_header}</b>",
+            )
+            await answer_callback_query(callback_id, "Sent as .lrc file!")
+        else:
+            await answer_callback_query(callback_id, "No content to convert.")
+        return
+
+    # Handle Time Shift Button Clicks directly on THAT message
+    if callback_data.startswith("shift_"):
+        shift_action = callback_data.replace("shift_", "")
+        if shift_action == "help":
+            await answer_callback_query(
+                callback_id,
+                "Reply to this message with /shift -300 or /shift +500 to adjust!",
+            )
+            return
+
+        shift_ms = parse_shift_offset(shift_action)
+        current_text = message.get("text", "")
+
+        if current_text and "[" in current_text:
+            shifted_text = apply_time_shift(current_text, shift_ms)
+            await edit_telegram_message(
+                chat_id, message_id, shifted_text, reply_markup=build_editor_keyboard()
+            )
+            sign = "+" if shift_ms > 0 else ""
+            await answer_callback_query(callback_id, f"Adjusted {sign}{shift_ms}ms")
+        else:
+            await answer_callback_query(
+                callback_id, "No timestamps found to shift."
+            )
+        return
+
+    # Handle Initial Download/Selection Buttons
+    await answer_callback_query(callback_id)
     parts = callback_data.split("_")
     if len(parts) < 3 or parts[0] != "dl":
         return
@@ -253,7 +423,6 @@ async def process_callback(callback_data: str, chat_id: int, callback_id: str):
     track_id = parts[1]
     mode_flag = parts[2]
 
-    # Directly fetch track lyrics by ID from LRCLIB
     async with httpx.AsyncClient(headers=HEADERS, timeout=10.0) as client:
         resp = await client.get(f"{LRCLIB_API_URL}/get/{track_id}")
         if resp.status_code != 200:
@@ -282,7 +451,9 @@ async def process_callback(callback_data: str, chat_id: int, callback_id: str):
         full_text = header + lyrics_content
         if len(full_text) > 4000:
             full_text = full_text[:3900] + "\n\n...[Truncated]"
-        await reply_telegram(chat_id, full_text)
+        await reply_telegram(
+            chat_id, full_text, reply_markup=build_editor_keyboard()
+        )
     else:
         filename = f"{track_name} - {artist_name}.{file_ext}"
         caption = f"🎵 <b>{track_name}</b> - {artist_name}"
@@ -292,11 +463,10 @@ async def process_callback(callback_data: str, chat_id: int, callback_id: str):
 
 
 # ------------------------------------------------------------------
-# FastAPI App Startup & Webhook Route
+# FastAPI Webhook Router
 # ------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    """Automatically registers Webhook with Telegram on server startup."""
     if WEBHOOK_URL and BOT_TOKEN:
         webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -311,7 +481,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         data = await request.json()
 
-        # Handle regular user text message
         if "message" in data:
             msg = data["message"]
             chat_id = msg["chat"]["id"]
@@ -324,27 +493,16 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 background_tasks.add_task(send_welcome, chat_id)
                 return Response(status_code=status.HTTP_200_OK)
 
-            if text.lower().startswith("/searchagain"):
-                background_tasks.add_task(
-                    reply_telegram,
-                    chat_id,
-                    "🔄 Search state reset! Send your next query with /search.",
-                )
+            if text.lower().startswith("/shift"):
+                background_tasks.add_task(handle_shift_command, chat_id, msg)
                 return Response(status_code=status.HTTP_200_OK)
 
             background_tasks.add_task(process_search, chat_id, text)
             return Response(status_code=status.HTTP_200_OK)
 
-        # Handle inline button selections
         if "callback_query" in data:
             cb = data["callback_query"]
-            chat_id = cb["message"]["chat"]["id"]
-            callback_id = cb["id"]
-            callback_data = cb.get("data", "")
-
-            background_tasks.add_task(
-                process_callback, callback_data, chat_id, callback_id
-            )
+            background_tasks.add_task(process_callback, cb)
             return Response(status_code=status.HTTP_200_OK)
 
     except Exception as e:
