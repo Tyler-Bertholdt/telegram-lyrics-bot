@@ -23,25 +23,20 @@ PORT = int(os.getenv("PORT", 8000))
 
 LRCLIB_API_URL = "https://lrclib.net/api/search"
 
-# Initialize Telegram Application
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 
 def parse_search_query(query_text: str) -> dict:
-    """Parses raw user input into LRCLIB query parameters and output preferences."""
     is_text_only = bool(re.search(r"\$lyrics\b", query_text, re.IGNORECASE))
     is_plain = bool(re.search(r"\$plain\b", query_text, re.IGNORECASE))
     is_synced = bool(re.search(r"\$synced\b", query_text, re.IGNORECASE))
 
-    # Default lyric preference is synced unless explicitly specified as plain
     lyric_type = "plain" if is_plain else "synced"
 
-    # Remove boolean flags
     clean_text = re.sub(
         r"\$(lyrics|synced|plain)\b", "", query_text, flags=re.IGNORECASE
     ).strip()
 
-    # Extract key-value flags using safe escaped quotes
     artist_match = re.search(
         r'\$artist\s+["\']?([^"\'$\n]+)["\']?', clean_text, re.IGNORECASE
     )
@@ -67,7 +62,6 @@ def parse_search_query(query_text: str) -> dict:
         elif duration_str.isdigit():
             duration_sec = int(duration_str)
 
-    # Clean track title by stripping command and remaining flag patterns
     track = re.sub(
         r'\$(artist|album|duration)\s+["\']?[^"\'$\n]+["\']?',
         "",
@@ -87,7 +81,6 @@ def parse_search_query(query_text: str) -> dict:
 
 
 async def execute_lrclib_search(parsed_data: dict) -> list:
-    """Executes search against LRCLIB API using extracted query parameters."""
     params = {}
     if parsed_data["track_name"] and parsed_data["artist_name"]:
         params["track_name"] = parsed_data["track_name"]
@@ -291,7 +284,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# Register Handlers
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", help_command))
 telegram_app.add_handler(CommandHandler("searchagain", searchagain_command))
@@ -302,7 +294,6 @@ telegram_app.add_handler(
 telegram_app.add_handler(CallbackQueryHandler(button_callback))
 
 
-# FastAPI Webhook Setup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await telegram_app.initialize()
@@ -314,8 +305,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    if WEBHOOK_URL:
-        await telegram_app.bot.delete_webhook()
+    # ✅ DO NOT delete webhook on shutdown so Telegram keeps sending messages even after sleep
     await telegram_app.stop()
     await telegram_app.shutdown()
 
