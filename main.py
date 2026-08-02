@@ -41,15 +41,15 @@ def parse_search_query(query_text: str) -> dict:
         r"\$(lyrics|synced|plain)\b", "", query_text, flags=re.IGNORECASE
     ).strip()
 
-    # Extract key-value flags
+    # Extract key-value flags using safe escaped quotes
     artist_match = re.search(
-        r"\$artist\s+[" "']?([^"'$\n]+)[" '']?", clean_text, re.IGNORECASE
+        r'\$artist\s+["\']?([^"\'$\n]+)["\']?', clean_text, re.IGNORECASE
     )
     album_match = re.search(
-        r"\$album\s+[" "']?([^"'$\n]+)[" '']?", clean_text, re.IGNORECASE
+        r'\$album\s+["\']?([^"\'$\n]+)["\']?', clean_text, re.IGNORECASE
     )
     duration_match = re.search(
-        r"\$duration\s+[" "']?([^"'$\n]+)[" '']?", clean_text, re.IGNORECASE
+        r'\$duration\s+["\']?([^"\'$\n]+)["\']?', clean_text, re.IGNORECASE
     )
 
     artist = artist_match.group(1).strip() if artist_match else None
@@ -69,7 +69,7 @@ def parse_search_query(query_text: str) -> dict:
 
     # Clean track title by stripping command and remaining flag patterns
     track = re.sub(
-        r"\$(artist|album|duration)\s+[" "']?[^"'$\n]+[" '']?",
+        r'\$(artist|album|duration)\s+["\']?[^"\'$\n]+["\']?',
         "",
         clean_text,
         flags=re.IGNORECASE,
